@@ -168,6 +168,15 @@ class PaymentService:
         except KeyError:
             raise PaymentNotFound(f"payment {payment_id!r} not found") from None
 
+    def terminal_outcomes(self) -> dict[str, str]:
+        """Map of payment_id -> terminal status value, for reconciliation."""
+        with self._lock:
+            return {
+                p.payment_id: p.status.value
+                for p in self._intents.values()
+                if p.status in TERMINAL_STATES
+            }
+
     @staticmethod
     def _to_response(intent: PaymentIntent, replayed: bool) -> dict:
         return {
