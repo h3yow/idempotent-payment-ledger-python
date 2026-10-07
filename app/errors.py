@@ -35,3 +35,31 @@ class ValidationError(PaymentError):
     """Malformed request content (e.g. non-positive amount)."""
 
     code = "VALIDATION_ERROR"
+
+
+class RefundNotAllowed(PaymentError):
+    """Refund requested against a payment that never succeeded."""
+
+    code = "REFUND_NOT_ALLOWED"
+
+
+class RefundAmountExceeded(PaymentError):
+    """Cumulative refunds would exceed the original accepted amount."""
+
+    code = "REFUND_AMOUNT_EXCEEDED"
+
+
+class RefundNotFound(PaymentError):
+    code = "REFUND_NOT_FOUND"
+
+
+class CallbackAmountMismatch(PaymentError):
+    """Callback claims an amount different from the accepted record."""
+
+    code = "CALLBACK_AMOUNT_MISMATCH"
+
+
+class CallbackCurrencyMismatch(PaymentError):
+    """Callback claims a currency different from the accepted record."""
+
+    code = "CALLBACK_CURRENCY_MISMATCH"

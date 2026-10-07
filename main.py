@@ -5,10 +5,15 @@ from pydantic import BaseModel, Field
 
 from app.channel import CallbackProcessor, SimulatedChannel
 from app.errors import (
+    CallbackAmountMismatch,
+    CallbackCurrencyMismatch,
     IdempotencyConflict,
     InvalidStateTransition,
     PaymentError,
     PaymentNotFound,
+    RefundAmountExceeded,
+    RefundNotAllowed,
+    RefundNotFound,
     ValidationError,
 )
 from app.idempotency import IdempotencyStore
@@ -16,6 +21,7 @@ from app.ledger import Ledger
 from app.models import ChannelEvent, ChannelEventType, ChannelRecord
 from app.payments import CLEARING_ACCOUNT, PaymentService
 from app.reconcile import reconcile
+from app.refunds import RefundService
 
 app = FastAPI(title="Idempotent Payment Ledger")
 
@@ -23,11 +29,19 @@ app = FastAPI(title="Idempotent Payment Ledger")
 ledger = Ledger()
 idempotency = IdempotencyStore()
 payments = PaymentService(ledger, idempotency)
+refund_idempotency = IdempotencyStore()
+refunds = RefundService(payments, ledger, refund_idempotency)
 channel = SimulatedChannel()
-callbacks = CallbackProcessor(payments)
+callbacks = CallbackProcessor(payments, refunds)
 
 
 class CreatePaymentRequest(BaseModel):
+    idempotency_key: str = Field(min_length=1)
+    amount: int = Field(gt=0)
+    currency: str = Field(min_length=1)
+
+
+class CreateRefundRequest(BaseModel):
     idempotency_key: str = Field(min_length=1)
     amount: int = Field(gt=0)
     currency: str = Field(min_length=1)
@@ -39,6 +53,8 @@ class ChannelCallbackRequest(BaseModel):
     event_type: ChannelEventType
     amount: int = Field(gt=0)
     sequence: int = 0
+    refund_id: str | None = None
+    currency: str | None = None
 
 
 class ChannelEmitRequest(BaseModel):
@@ -47,10 +63,23 @@ class ChannelEmitRequest(BaseModel):
     succeeded: bool = True
 
 
+class ChannelRefundEmitRequest(BaseModel):
+    payment_id: str = Field(min_length=1)
+    refund_id: str = Field(min_length=1)
+    amount: int = Field(gt=0)
+    succeeded: bool = True
+    currency: str | None = None
+
+
 _ERROR_STATUS = {
     IdempotencyConflict: 409,
     InvalidStateTransition: 409,
     PaymentNotFound: 404,
+    RefundNotFound: 404,
+    RefundNotAllowed: 409,
+    RefundAmountExceeded: 422,
+    CallbackAmountMismatch: 422,
+    CallbackCurrencyMismatch: 422,
     ValidationError: 422,
 }
 
@@ -98,10 +127,69 @@ def expire_payment(payment_id: str):
     return {"payment_id": intent.payment_id, "status": intent.status}
 
 
+@app.post("/payments/{payment_id}/refunds", status_code=201)
+def create_refund(payment_id: str, req: CreateRefundRequest):
+    """Idempotently accept a partial or full refund of a succeeded payment."""
+    return refunds.create_refund(
+        payment_id, req.idempotency_key, req.amount, req.currency
+    )
+
+
+@app.get("/payments/{payment_id}/refunds")
+def list_refunds(payment_id: str):
+    # Ensure the payment exists for a stable 404 on unknown payments.
+    payments.get(payment_id)
+    return [
+        {
+            "refund_id": r.refund_id,
+            "payment_id": r.payment_id,
+            "idempotency_key": r.idempotency_key,
+            "amount": r.amount,
+            "currency": r.currency,
+            "status": r.status,
+            "version": r.version,
+        }
+        for r in refunds.refunds_for(payment_id)
+    ]
+
+
+@app.get("/refunds/{refund_id}")
+def get_refund(refund_id: str):
+    r = refunds.get(refund_id)
+    return {
+        "refund_id": r.refund_id,
+        "payment_id": r.payment_id,
+        "idempotency_key": r.idempotency_key,
+        "amount": r.amount,
+        "currency": r.currency,
+        "status": r.status,
+        "version": r.version,
+    }
+
+
+@app.post("/refunds/{refund_id}/expire")
+def expire_refund(refund_id: str):
+    r = refunds.expire_refund(refund_id)
+    return {"refund_id": r.refund_id, "status": r.status}
+
+
 @app.post("/channel/emit", status_code=201)
 def channel_emit(req: ChannelEmitRequest):
     """Simulated channel: settle a payment and emit a callback event."""
     event = channel.emit(req.payment_id, req.amount, req.succeeded)
+    return {"event_id": event.event_id, "sequence": event.sequence}
+
+
+@app.post("/channel/emit_refund", status_code=201)
+def channel_emit_refund(req: ChannelRefundEmitRequest):
+    """Simulated channel: settle a refund and emit a refund callback event."""
+    event = channel.emit_refund(
+        req.refund_id,
+        req.payment_id,
+        req.amount,
+        req.succeeded,
+        req.currency,
+    )
     return {"event_id": event.event_id, "sequence": event.sequence}
 
 
@@ -115,6 +203,8 @@ def handle_callback(req: ChannelCallbackRequest):
             event_type=req.event_type,
             amount=req.amount,
             sequence=req.sequence,
+            refund_id=req.refund_id,
+            currency=req.currency,
         )
     )
 
@@ -125,6 +215,7 @@ def list_entries():
         {
             "entry_id": e.entry_id,
             "payment_id": e.payment_id,
+            "refund_id": e.refund_id,
             "account": e.account,
             "direction": e.direction.value,
             "amount": e.amount,
@@ -137,7 +228,9 @@ def list_entries():
 @app.get("/reconcile")
 def run_reconcile():
     """Reconcile the local ledger against the simulated channel statement."""
-    report = reconcile(ledger, channel.statement(), CLEARING_ACCOUNT)
+    report = reconcile(
+        ledger, channel.statement(), CLEARING_ACCOUNT, refunds.all_refunds()
+    )
     return {
         "ok": report.ok,
         "matched": report.matched,
@@ -145,6 +238,7 @@ def run_reconcile():
             {
                 "diff_type": d.diff_type.value,
                 "payment_id": d.payment_id,
+                "refund_id": d.refund_id,
                 "ledger_amount": d.ledger_amount,
                 "channel_amount": d.channel_amount,
                 "detail": d.detail,

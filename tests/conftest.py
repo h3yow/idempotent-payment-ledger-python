@@ -6,6 +6,7 @@ from app.channel import CallbackProcessor, SimulatedChannel
 from app.idempotency import IdempotencyStore
 from app.ledger import Ledger
 from app.payments import PaymentService
+from app.refunds import RefundService
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [TEST] %(message)s", force=True
@@ -24,13 +25,18 @@ def service(ledger):
 
 
 @pytest.fixture()
+def refunds(service, ledger):
+    return RefundService(service, ledger, IdempotencyStore())
+
+
+@pytest.fixture()
 def channel():
     return SimulatedChannel()
 
 
 @pytest.fixture()
-def processor(service):
-    return CallbackProcessor(service)
+def processor(service, refunds):
+    return CallbackProcessor(service, refunds)
 
 
 def explain(key: str, status: str, rationale: str) -> None:
